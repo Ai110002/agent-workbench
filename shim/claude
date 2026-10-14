@@ -1,0 +1,6 @@
+#!/bin/bash
+# 工作台專用：claude 改用一般（非全螢幕）介面，往上捲時輸入框跟著被捲下去，點「⤓ 跳到最底下」回來。
+# 一般終端機分頁不經過這裡，照舊用 settings.json 的 tui 設定。
+self="$(cd "$(dirname "$0")" && pwd)"
+PATH="$(printf %s "$PATH" | tr : '\n' | grep -vxF "$self" | paste -sd:)"
+exec claude --settings '{"tui":"default"}' "$@"

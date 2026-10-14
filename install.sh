@@ -12,6 +12,12 @@ fi
 mkdir -p ~/.local/bin ~/.config/agent-ws ~/.config/systemd/user ~/.local/share/applications ~/.local/state/agent-lights
 install -m 755 bin/* ~/.local/bin/
 install -m 644 config/tmux.conf ~/.config/agent-ws/tmux.conf
+install -D -m 755 shim/claude ~/.config/agent-ws/bin/claude
+grep -q 'agent-ws/bin' ~/.bashrc || cat >> ~/.bashrc <<'RC'
+
+# Agent 工作台（tmux -L agents）裡的 claude 改用一般介面（~/.config/agent-ws/bin/claude）
+case "$TMUX" in */agents,*) PATH="$HOME/.config/agent-ws/bin:$PATH" ;; esac
+RC
 install -m 644 systemd/agent-lights.service ~/.config/systemd/user/
 install -m 644 desktop/agent-ws.desktop ~/.local/share/applications/
 systemctl --user daemon-reload

@@ -36,7 +36,7 @@ cd agent-workbench
 
 燈號要接上 Claude Code：把 `hooks/claude-settings-hooks.json` 裡的 `hooks` 合併進 `~/.claude/settings.json`。
 
-建議在 `~/.claude/settings.json` 加上 `"tui": "fullscreen"`：Claude 會自己處理滾輪捲動，不會跳進 tmux 的捲動模式（右上角出現行數和時間）。有自訂狀態列的話，可以在 `statusLine` 加 `"refreshInterval": 30`，閒置的格子也會定時更新。
+工作台裡的 Claude 一律用一般介面（`shim/claude` 自動加 `--settings '{"tui":"default"}'`，一般終端機分頁不受影響）：往上捲時輸入框和狀態列會一起被捲下去，四格並排時才有空間看內容；點名牌上的「⤓ 跳到最底下」或捲回底部就回來。有自訂狀態列的話，可以在 `statusLine` 加 `"refreshInterval": 30`，閒置的格子也會定時更新。
 
 ## 使用
 
@@ -73,6 +73,7 @@ cd agent-workbench
 | `bin/ws-clip` | Ctrl+C／Ctrl+V |
 | `bin/agent-light` | 燈號、通知、跳分頁（也支援一般 GNOME Terminal 分頁） |
 | `bin/agent-done-notify` | agent 做完時的 hook |
+| `shim/claude` | 工作台裡的 claude 包裝（改用一般介面） |
 | `config/tmux.conf` | 工作台專用的 tmux 設定（獨立的 `tmux -L agents`，不影響你原本的 tmux） |
 
 ## 已知限制

@@ -21,7 +21,7 @@
 - **左側欄**：每個工作一張卡片，有燈號、名稱、agent 和帳號、實際資料夾、git 分支、網路埠、最後一句話；點卡片就跳過去
 - **燈號**：🔴＝在等你允許或回答，🟢＝做完還沒回；格子外框也會跟著變色。要等你送出下一句才會熄（看過不等於處理完），沒回會在 3／6／10 分鐘再提醒
 - **接回對話**：側邊欄每 5 秒記一次每格開著哪個對話。終端機被整個關掉後，打 `ws restore` 就全部接回
-- **Ctrl+C／Ctrl+V 不用加 Shift**：滾輪可以往上捲（不顯示行數時間，名牌出現 Claude 原本的「Jump to bottom (ctrl+End) ↓」，點它或按 Ctrl+End 回到底部，捲回底部自動離開）；拖曳反白放開就複製，之後 5 秒內按 Ctrl+C 只提示已複製、不會中斷 agent；其他時候 Ctrl+C 照舊是中斷；Ctrl+V 遇到文字直接貼上，遇到圖片照舊交給 Claude 貼圖
+- **Ctrl+C／Ctrl+V 不用加 Shift**：滾輪往上捲時整格一起捲（輸入框也會被捲走），下方中間出現 Claude 原本的「Jump to bottom (ctrl+End) ↓」字卡，點它、按 Ctrl+End 或直接打字就回到底部，捲回底部自動離開）；拖曳反白放開就複製，之後 5 秒內按 Ctrl+C 只提示已複製、不會中斷 agent；其他時候 Ctrl+C 照舊是中斷；Ctrl+V 遇到文字直接貼上，遇到圖片照舊交給 Claude 貼圖
 - **防誤觸**：工作台裡停用 Ctrl+Z（會把 agent 整個暫停）；側邊欄不會被 Ctrl+C 弄掉，當掉會自己重開
 
 ## 安裝
@@ -70,6 +70,7 @@ cd agent-workbench
 | `bin/ws` | 工作台主程式 |
 | `bin/ws-grid` | 排等大格子 |
 | `bin/ws-sidebar` | 側邊欄（Python curses） |
+| `bin/ws-scroll` | 往上捲時的捲動畫面（字卡畫在原位：下方中間） |
 | `bin/ws-clip` | Ctrl+C／Ctrl+V |
 | `bin/agent-light` | 燈號、通知、跳分頁（也支援一般 GNOME Terminal 分頁） |
 | `bin/agent-done-notify` | agent 做完時的 hook |

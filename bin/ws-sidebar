@@ -13,7 +13,7 @@ SESS_DIRS = [Path(HOME, ".claude/sessions"), Path(HOME, ".claude-b/sessions")]
 AGENTS = ("claude", "codex", "grok", "dsh")
 SEP = "‖¦‖"
 FIELDS = ["pane_id", "@slot", "pane_pid", "pane_active", "window_zoomed_flag", "pane_current_path",
-          "pane_current_command", "@role", "@task", "@light", "@age", "@msg", "@ask"]
+          "pane_current_command", "@role", "@task", "@light", "@age", "@msg", "@ask", "@target"]
 
 
 def t(*a):
@@ -126,6 +126,9 @@ def collect():
     for line in raw.splitlines():
         v = dict(zip(FIELDS, line.split(SEP)))
         if v.get("@role") == "sidebar": continue
+        if v.get("@role") == "scroll" and v.get("@target"):   # 捲動畫面蓋著的那格：資訊照原本那格
+            tv = t("display", "-p", "-t", v["@target"], SEP.join("#{%s}" % f for f in ("pane_pid", "pane_current_path", "pane_current_command"))).strip().split(SEP)
+            if len(tv) == 3: v["pane_pid"], v["pane_current_path"], v["pane_current_command"] = tv
         pids = descendants(int(v["pane_pid"]), kids)
         agent, apid = "", None
         for p in pids:
@@ -147,6 +150,7 @@ def collect():
 
 
 def save(cards):
+    if any(c.get("@role") == "scroll" for c in cards): return   # 捲動中先不存，避免把那格記成空的
     rec = [dict(task=c["@task"], agent=c["agent"], session=c["session"], config=c["config"], cwd=c["cwd"])
            for c in cards if c["@task"] != "空格"]
     if not rec: return

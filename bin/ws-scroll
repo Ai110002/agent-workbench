@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""工作台的捲動畫面：往上捲時暫時蓋在那一格，在原位（下方中間）畫 Claude 原本的「Jump to bottom (ctrl+End) ↓」字卡。
+
+  ws-scroll start <pane>   滾輪往上時由 tmux 呼叫
+  ws-scroll view <pane>    捲動畫面本體（start 開的）
+
+做法：開一個隱藏視窗跑捲動畫面，大小調成跟那格一樣，再跟那格對調位置；
+離開時對調回來、隱藏視窗自己關掉。Claude 的格子大小不變，不會重畫。
+點字卡、按 Ctrl+End／End／Esc、或捲回最底下就離開；直接打字也會離開並把字送給 Claude。"""
+import fcntl, os, re, select, signal, subprocess, sys, termios, time, tty, unicodedata
+
+T = ["tmux", "-L", "agents"]
+LABEL = " Jump to bottom (ctrl+End) ↓ "
+STEP = 3
+MIRROR = ["@light", "@age", "@msg", "@ask", "@task", "@slot"]
+
+
+def t(*a):
+    return subprocess.run(T + list(a), capture_output=True, text=True, timeout=5).stdout
+
+
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 0 if unicodedata.combining(c) else 1 for c in s)
+
+
+def win_name(pane):
+    return t("display", "-p", "-t", pane, "#{window_name}").strip()
+
+
+def start(target):
+    lock = open(f"/tmp/ws-scroll-{os.getuid()}.lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)    # 連續滾輪會同時叫好幾次：排隊，只開一個
+    me = os.path.abspath(__file__)
+    if win_name(target) == "_scroll":
+        return
+    if t("show", "-pqv", "-t", target, "@scroll_view").strip() or t("show", "-pqv", "-t", target, "@role").strip() == "scroll":
+        return
+    t("set", "-p", "-t", target, "@scroll_view", "starting")   # 連續滾輪只開一次
+    w, h = t("display", "-p", "-t", target, "#{pane_width} #{pane_height}").split()
+    out = t("new-window", "-d", "-n", "_scroll", "-P", "-F", "#{window_id} #{pane_id}",
+            f"python3 {me} view {target} 2>>$HOME/.local/state/agent-ws-scroll.log").split()
+    if len(out) != 2:
+        t("set", "-pu", "-t", target, "@scroll_view"); return
+    win, view = out
+    t("set", "-w", "-t", win, "window-size", "manual")
+    t("resize-window", "-t", win, "-x", w, "-y", h)
+    for o in MIRROR:
+        v = t("show", "-pqv", "-t", target, o).rstrip("\n")
+        if v: t("set", "-p", "-t", view, o, v)
+    t("set", "-p", "-t", view, "@role", "scroll")
+    t("set", "-p", "-t", view, "@target", target)
+    t("set", "-p", "-t", target, "@scroll_view", view)
+    active = t("display", "-p", "-t", target, "#{pane_active}").strip() == "1"
+    t("swap-pane", "-d", "-s", view, "-t", target)
+    if active: t("select-pane", "-t", view)
+    time.sleep(0.3)   # 等捲動畫面開啟滑鼠，之後的滾輪才會交給它
+
+
+class View:
+    def __init__(self, target):
+        self.target = target
+        self.me = os.environ.get("TMUX_PANE", "")
+        self.offset = STEP
+        self.sel = None          # (起點 (行, 欄), 終點 (行, 欄))，行是整份紀錄裡的行號
+        self.dragging = False
+        self.load()
+
+    def load(self):
+        self.color = t("capture-pane", "-p", "-e", "-S", "-", "-E", "-", "-t", self.target).split("\n")
+        self.plain = t("capture-pane", "-p", "-S", "-", "-E", "-", "-t", self.target).split("\n")
+        while len(self.color) > 1 and not self.plain[-1].strip():
+            self.color.pop(); self.plain.pop()
+
+    def size(self):
+        try:
+            c, r = os.get_terminal_size()
+        except OSError:
+            c, r = 80, 24
+        return c, r
+
+    def top(self):
+        _, h = self.size()
+        return max(0, len(self.plain) - self.offset - h)
+
+    def clamp(self):
+        _, h = self.size()
+        self.offset = max(0, min(self.offset, max(0, len(self.plain) - h)))
+
+    def label_pos(self):
+        w, h = self.size()
+        return max(1, h - 1), max(1, (w - width(LABEL)) // 2 + 1)
+
+    def on_label(self, row, col):
+        r, c = self.label_pos()
+        return row == r and c <= col < c + width(LABEL)
+
+    def sel_range(self):
+        (a, b) = self.sel
+        return (a, b) if a <= b else (b, a)
+
+    def line_with_sel(self, idx, w):
+        """把選取範圍畫成反白（用純文字）"""
+        (r0, c0), (r1, c1) = self.sel_range()
+        s = self.plain[idx] if idx < len(self.plain) else ""
+        lo = c0 if idx == r0 else 0
+        hi = c1 if idx == r1 else w
+        out, col = "", 0
+        for ch in s:
+            cw = width(ch)
+            inside = lo <= col < hi
+            out += ("\x1b[7m" + ch + "\x1b[27m") if inside else ch
+            col += cw
+        if idx != r1 and col < w and lo <= col: out += "\x1b[7m \x1b[27m"
+        return out
+
+    def draw(self):
+        w, h = self.size()
+        top = self.top()
+        buf = ["\x1b[?25l"]
+        for i in range(h):
+            idx = top + i
+            if self.sel and self.sel_range()[0][0] <= idx <= self.sel_range()[1][0]:
+                line = self.line_with_sel(idx, w)
+            else:
+                line = self.color[idx] if idx < len(self.color) else ""
+            buf.append(f"\x1b[{i + 1};1H\x1b[0m{line}\x1b[0m\x1b[K")
+        r, c = self.label_pos()
+        buf.append(f"\x1b[{r};{c}H\x1b[48;5;238m\x1b[38;5;231m{LABEL}\x1b[0m")
+        sys.stdout.write("".join(buf)); sys.stdout.flush()
+
+    def refresh(self):
+        old = len(self.plain)
+        self.load()
+        if self.offset: self.offset += len(self.plain) - old   # 新的輸出進來時畫面停在原處
+        self.clamp()
+        for o in ("@light", "@age", "@msg", "@ask"):
+            v = t("show", "-pqv", "-t", self.target, o).rstrip("\n")
+            t("set", "-p", "-t", self.me, o, v) if v else t("set", "-pu", "-t", self.me, o)
+
+    def pos_to_text(self, row, col):
+        return (self.top() + row - 1, col - 1)
+
+    def copy(self):
+        (r0, c0), (r1, c1) = self.sel_range()
+        lines = []
+        for idx in range(r0, r1 + 1):
+            s = self.plain[idx] if idx < len(self.plain) else ""
+            lo = c0 if idx == r0 else 0
+            hi = c1 if idx == r1 else 10 ** 6
+            part, col = "", 0
+            for ch in s:
+                if lo <= col < hi: part += ch
+                col += width(ch)
+            lines.append(part.rstrip())
+        text = "\n".join(lines)
+        if text.strip():
+            subprocess.run([os.path.expanduser("~/.local/bin/ws-clip"), "copy"], input=text, text=True)
+
+    def mouse(self, b, col, row, release):
+        if b == 64: self.offset += STEP; self.sel = None
+        elif b == 65:
+            self.offset -= STEP; self.sel = None
+            if self.offset <= 0: return "exit"
+        elif b == 0 and not release:
+            if self.on_label(row, col): return "exit"
+            self.sel = (self.pos_to_text(row, col),) * 2; self.dragging = False
+        elif b == 32 and self.sel:
+            self.sel = (self.sel[0], self.pos_to_text(row, col + 1)); self.dragging = True
+        elif release and (b & 3) == 0:
+            if self.dragging and self.sel:
+                self.copy()
+                self.sel = None
+            else:
+                self.sel = None
+            self.dragging = False
+        self.clamp()
+
+    def run(self):
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setraw(fd)
+        signal.signal(signal.SIGWINCH, lambda *_: (self.clamp(), self.draw()))   # 大小一變就重畫，字卡才會馬上置中
+        sys.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?25l")
+        forward = b""
+        try:
+            self.clamp(); self.draw()
+            last = time.time()
+            while True:
+                r, _, _ = select.select([fd], [], [], 0.5)
+                if not r:
+                    if time.time() - last > 0.9:
+                        self.refresh(); last = time.time()
+                    self.draw(); continue
+                data = os.read(fd, 4096)
+                if os.environ.get("WS_SCROLL_DEBUG"): print(repr(data), file=sys.stderr, flush=True)
+                if not data: break
+                act = None
+                rest = data
+                for m in re.finditer(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])", data):
+                    act = self.mouse(int(m[1]), int(m[2]), int(m[3]), m[4] == b"m") or act
+                rest = re.sub(rb"\x1b\[<\d+;\d+;\d+[Mm]", b"", data)
+                if act == "exit": break
+                if rest:
+                    keys = {b"\x1b[1;5F": "exit", b"\x1b[F": "exit", b"\x1b[4~": "exit", b"\x1bOF": "exit",
+                            b"\x1b": "exit", b"\x1b[5~": "pgup", b"\x1b[6~": "pgdn",
+                            b"\x1b[A": "up", b"\x1b[B": "down"}
+                    k = keys.get(rest)
+                    w, h = self.size()
+                    if k == "exit": break
+                    elif k == "pgup": self.offset += h - 1
+                    elif k == "pgdn":
+                        self.offset -= h - 1
+                        if self.offset <= 0: break
+                    elif k == "up": self.offset += 1
+                    elif k == "down":
+                        self.offset -= 1
+                        if self.offset <= 0: break
+                    elif rest == b"\x03":
+                        if self.sel: self.copy(); self.sel = None
+                        else: break
+                    else:
+                        forward = rest; break     # 打字：回到底部並把字交給 Claude
+                    self.clamp()
+                self.draw()
+        finally:
+            sys.stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l"); sys.stdout.flush()
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            active = t("display", "-p", "-t", self.me, "#{pane_active}").strip() == "1"
+            if win_name(self.target) == "_scroll" and win_name(self.me) != "_scroll":   # 只在位置確實對調著時才換回來
+                t("swap-pane", "-d", "-s", self.target, "-t", self.me)
+            t("set", "-pu", "-t", self.target, "@scroll_view")
+            if active: t("select-pane", "-t", self.target)
+            if forward:
+                t("send-keys", "-t", self.target, "-H", *[f"{x:02x}" for x in forward])
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "start":
+        start(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "view":
+        View(sys.argv[2]).run()
+    else:
+        sys.exit(__doc__)

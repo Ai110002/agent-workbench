@@ -36,7 +36,7 @@ cd agent-workbench
 
 燈號要接上 Claude Code：把 `hooks/claude-settings-hooks.json` 裡的 `hooks` 合併進 `~/.claude/settings.json`。
 
-建議在 `~/.claude/settings.json` 加上 `"tui": "fullscreen"`：Claude 會自己處理滾輪捲動，不會跳進 tmux 的捲動模式（右上角出現行數和時間）。
+建議在 `~/.claude/settings.json` 加上 `"tui": "fullscreen"`：Claude 會自己處理滾輪捲動，不會跳進 tmux 的捲動模式（右上角出現行數和時間）。有自訂狀態列的話，可以在 `statusLine` 加 `"refreshInterval": 30`，閒置的格子也會定時更新。
 
 ## 使用
 

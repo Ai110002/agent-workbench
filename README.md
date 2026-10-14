@@ -36,7 +36,7 @@ cd agent-workbench
 
 燈號要接上 Claude Code：把 `hooks/claude-settings-hooks.json` 裡的 `hooks` 合併進 `~/.claude/settings.json`。
 
-工作台裡的 Claude 一律用一般介面（`shim/claude` 自動加 `--settings '{"tui":"default"}'`，一般終端機分頁不受影響）：往上捲時輸入框和狀態列會一起被捲下去，四格並排時才有空間看內容；點名牌上的「Jump to bottom (ctrl+End) ↓」或捲回底部就回來。有自訂狀態列的話，可以在 `statusLine` 加 `"refreshInterval": 30`，閒置的格子也會定時更新。
+工作台裡的 Claude 一律用一般介面（`shim/claude` 自動加 `--settings '{"tui":"default"}'`，一般終端機分頁不受影響）：往上捲時輸入框和狀態列會一起被捲下去，四格並排時才有空間看內容；點格子下方中間的「Jump to bottom (ctrl+End) ↓」、按 Ctrl+End 或捲回底部就回來。有自訂狀態列的話，可以在 `statusLine` 加 `"refreshInterval": 30`，閒置的格子也會定時更新。
 
 ## 使用
 

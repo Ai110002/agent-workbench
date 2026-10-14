@@ -36,6 +36,8 @@ cd agent-workbench
 
 燈號要接上 Claude Code：把 `hooks/claude-settings-hooks.json` 裡的 `hooks` 合併進 `~/.claude/settings.json`。
 
+建議在 `~/.claude/settings.json` 加上 `"tui": "fullscreen"`：Claude 會自己處理滾輪捲動，不會跳進 tmux 的捲動模式（右上角出現行數和時間）。
+
 ## 使用
 
 開工作台：打 `ws`，或從應用程式選單找「Agent 工作台」。

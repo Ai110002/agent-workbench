@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # 工作台的 Ctrl+C／Ctrl+V：
 #   ws-clip copy          從 stdin 收文字放進系統剪貼簿（tmux 反白後呼叫）
+#   ws-clip ctrl-c <pane> 剛複製完 5 秒內只提示「已複製」，否則照送 Ctrl+C（中斷）
 #   ws-clip paste <pane>  剪貼簿是圖片 → 照舊送 Ctrl+V 給格子（Claude 貼圖）；是文字 → 直接貼進去
 export DISPLAY=${DISPLAY:-:0}
 T=(tmux -L agents)
 case "$1" in
-  copy) xclip -selection clipboard -i >/dev/null 2>&1 ;;
+  copy)
+    xclip -selection clipboard -i >/dev/null 2>&1
+    "${T[@]}" set -g @copied_at "$(date +%s)" ;;
+  ctrl-c)  # 剛反白複製完 5 秒內的 Ctrl+C 當成「複製」，不送中斷給 agent
+    t=$("${T[@]}" show -gqv @copied_at); t=${t:-0}
+    if [ $(( $(date +%s) - t )) -lt 5 ]; then
+      "${T[@]}" display -d 1500 "已複製（放開滑鼠時就複製好了）"
+    else
+      "${T[@]}" send-keys -t "$2" C-c
+    fi ;;
   paste)
     types=$(timeout 2 xclip -selection clipboard -o -t TARGETS 2>/dev/null)
     if grep -q '^image/' <<<"$types" || [ -z "$types" ]; then

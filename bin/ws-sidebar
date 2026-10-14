@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""工作台側邊欄（參考 cmux）：每個工作一張卡片——燈號、名稱、等多久、哪個 agent、資料夾、git 分支、
+開著的網路埠、它最後說的話。滑鼠點卡片或 ↑↓ Enter 跳過去。
+順便每次刷新把「哪格開著哪個對話」存到 ~/.config/agent-ws/last.json，終端機被關掉後 ws restore 可以全部接回。"""
+import curses, json, locale, os, re, signal, subprocess, time, unicodedata
+from pathlib import Path
+
+T = ["tmux", "-L", "agents"]
+S = "work"
+HOME = os.path.expanduser("~")
+SAVE = Path(HOME, ".config/agent-ws/last.json")
+SESS_DIRS = [Path(HOME, ".claude/sessions"), Path(HOME, ".claude-b/sessions")]
+AGENTS = ("claude", "codex", "grok", "dsh")
+SEP = "‖¦‖"
+FIELDS = ["pane_id", "@slot", "pane_pid", "pane_active", "window_zoomed_flag", "pane_current_path",
+          "pane_current_command", "@role", "@task", "@light", "@age", "@msg", "@ask"]
+
+
+def t(*a):
+    try:
+        return subprocess.run(T + list(a), capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return ""
+
+
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 0 if unicodedata.combining(c) else 1 for c in s)
+
+
+def cut(s, w):
+    out, n = "", 0
+    for c in s:
+        cw = width(c)
+        if n + cw > w:
+            return out[:-1] + "…" if out else ""
+        out += c; n += cw
+    return out
+
+
+def wrap(s, w, lines):
+    res = []
+    while s and len(res) < lines:
+        part, n = "", 0
+        for c in s:
+            if n + width(c) > w: break
+            part += c; n += width(c)
+        s = s[len(part):]
+        res.append(part)
+    if s and res: res[-1] = cut(res[-1] + s, w)
+    return res
+
+
+def procs():
+    kids, comm = {}, {}
+    for line in subprocess.run(["ps", "-eo", "pid=,ppid=,comm="], capture_output=True, text=True).stdout.splitlines():
+        p = line.split(None, 2)
+        if len(p) == 3:
+            kids.setdefault(int(p[1]), []).append(int(p[0])); comm[int(p[0])] = p[2]
+    return kids, comm
+
+
+def descendants(pid, kids):
+    out, st = [], [pid]
+    while st:
+        p = st.pop(); out.append(p); st.extend(kids.get(p, []))
+    return out
+
+
+def ports_by_pid():
+    m = {}
+    out = subprocess.run(["ss", "-ltnpH"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) < 4: continue
+        port = cols[3].rsplit(":", 1)[-1]
+        for pid in re.findall(r"pid=(\d+)", line):
+            m.setdefault(int(pid), set()).add(port)
+    return m
+
+
+def git_branch(d):
+    p = Path(d)
+    for q in [p, *p.parents]:
+        h = q / ".git" / "HEAD"
+        if h.is_file():
+            s = h.read_text().strip()
+            return s.rsplit("/", 1)[-1] if s.startswith("ref:") else s[:7]
+        if q == Path(HOME): break
+    return ""
+
+
+def session_of(pid):
+    for d in SESS_DIRS:
+        f = d / f"{pid}.json"
+        if f.is_file():
+            try:
+                j = json.loads(f.read_text()); j["_config"] = str(d.parent); return j
+            except Exception:
+                pass
+    return None
+
+
+_cwd_cache = {}
+def work_dir(sess):
+    """對話實際在做事的資料夾：讀對話紀錄最後一段裡的 cwd（Bash cd 之後會變）"""
+    proj = re.sub(r"[^A-Za-z0-9]", "-", sess.get("cwd", ""))
+    f = Path(sess["_config"], "projects", proj, sess.get("sessionId", "") + ".jsonl")
+    try:
+        st = f.stat()
+    except OSError:
+        return sess.get("cwd", "")
+    k = (str(f), st.st_mtime)
+    if k not in _cwd_cache:
+        with open(f, "rb") as fh:
+            fh.seek(max(st.st_size - 200000, 0))
+            hits = re.findall(rb'"cwd":"([^"]+)"', fh.read())
+        _cwd_cache[k] = hits[-1].decode() if hits else sess.get("cwd", "")
+    return _cwd_cache[k]
+
+
+def collect():
+    raw = t("list-panes", "-t", S, "-F", SEP.join("#{%s}" % f for f in FIELDS))
+    kids, comm = procs()
+    ports = ports_by_pid()
+    cards = []
+    for line in raw.splitlines():
+        v = dict(zip(FIELDS, line.split(SEP)))
+        if v.get("@role") == "sidebar": continue
+        pids = descendants(int(v["pane_pid"]), kids)
+        agent, apid = "", None
+        for p in pids:
+            name = comm.get(p, "")
+            if name in AGENTS or name.startswith("claude"):
+                agent, apid = ("claude" if name.startswith("claude") else name), p; break
+        sess = session_of(apid) if agent == "claude" else None
+        cwd = work_dir(sess) if sess else v["pane_current_path"]
+        if apid and not sess:
+            try: cwd = os.readlink(f"/proc/{apid}/cwd")
+            except OSError: pass
+        acct = ""
+        if sess: acct = "B" if ".claude-b" in sess["_config"] else "A"
+        pset = sorted({pt for p in pids for pt in ports.get(p, ())}, key=lambda x: int(x) if x.isdigit() else 0)
+        cards.append(dict(v, agent=agent, acct=acct, cwd=cwd, branch=git_branch(cwd), ports=pset,
+                          busy=(sess or {}).get("status") == "busy", session=(sess or {}).get("sessionId", ""),
+                          config=(sess or {}).get("_config", "")))
+    return cards
+
+
+def save(cards):
+    rec = [dict(task=c["@task"], agent=c["agent"], session=c["session"], config=c["config"], cwd=c["cwd"])
+           for c in cards if c["@task"] != "空格"]
+    if not rec: return
+    try:
+        old = json.loads(SAVE.read_text()) if SAVE.exists() else {}
+    except Exception:
+        old = {}
+    if old.get("panes") == rec: return
+    SAVE.write_text(json.dumps(dict(saved_at=time.strftime("%F %T"), panes=rec), ensure_ascii=False, indent=1))
+
+
+class Wake(Exception):
+    pass
+
+
+def on_wake(*_):
+    raise Wake
+
+
+def main(scr):
+    # 切換格子時 tmux 會 kill -USR1 這個程序，立刻重畫（不用等 1.5 秒輪詢）
+    signal.signal(signal.SIGUSR1, on_wake)
+    t("set", "-g", "@sidebar_pid", str(os.getpid()))
+    curses.curs_set(0); curses.use_default_colors()
+    curses.raw()  # Ctrl+C／Ctrl+Z 當一般按鍵，不會把側邊欄弄掉
+    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+    pairs = dict(red=(231, 160), green=(231, 28), dim=(244, -1), name=(231, -1), sel=(231, 24), cyan=(45, -1), yel=(220, -1))
+    for i, (k, (fg, bg)) in enumerate(pairs.items(), 1):
+        curses.init_pair(i, fg, bg); pairs[k] = curses.color_pair(i)
+    scr.timeout(1500)
+    cursor, rowmap, last_save = 0, {}, 0
+    while True:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})  # 重畫途中不被打斷
+        cards = collect()
+        if time.time() - last_save > 5:
+            save(cards); last_save = time.time()
+        H, W = scr.getmaxyx(); w = W - 1
+        scr.erase(); rowmap = {}
+        waiting = sum(c["@light"] == "wait" for c in cards); done = sum(c["@light"] == "done" for c in cards)
+        head = f" {len(cards)} 個工作"
+        if waiting: head += f"  🔴{waiting}"
+        if done: head += f"  🟢{done}"
+        scr.addstr(0, 0, cut(head, w), curses.A_BOLD)
+        y = 2
+        cursor = min(cursor, max(len(cards) - 1, 0))
+        for i, c in enumerate(cards):
+            if y >= H - 2: break
+            top = y
+            act = c["pane_active"] == "1"
+            if c["@light"] == "wait": badge, bst = f" 🔴 等你 {c['@age']} ", pairs["red"]
+            elif c["@light"] == "done": badge, bst = f" 🟢 做完 {c['@age']} ", pairs["green"]
+            elif c["busy"]: badge, bst = " ⏳ 進行中 ", pairs["yel"]
+            elif c["@task"] == "空格": badge, bst = " · 空格 ", pairs["dim"]
+            else: badge, bst = " · 閒置 ", pairs["dim"]
+            mark = "▶" if act else " "
+            scr.addstr(y, 0, f"{mark}{c['@slot']}", pairs["cyan"] | curses.A_BOLD)
+            scr.addstr(y, 3, cut(badge, w - 3), bst | curses.A_BOLD)
+            y += 1
+            name = c["@task"] or "(未命名)"
+            scr.addstr(y, 1, cut(name, w - 1), (pairs["sel"] if i == cursor else pairs["name"]) | curses.A_BOLD); y += 1
+            if c["@task"] != "空格":
+                who = c["agent"] + (" " + c["acct"] if c["acct"] else "") if c["agent"] else c["pane_current_command"]
+                d = c["cwd"].replace(HOME, "~", 1)
+                info = f"{who} · {d}" + (f"  {c['branch']}" if c["branch"] else "")
+                if y < H - 2: scr.addstr(y, 1, cut(info, w - 1), pairs["dim"]); y += 1
+                if c["ports"] and y < H - 2:
+                    scr.addstr(y, 1, cut("埠 " + " ".join(":" + p for p in c["ports"]), w - 1), pairs["cyan"]); y += 1
+                msg = ("它說：" + c["@msg"]) if c["@msg"] else (("你問：" + c["@ask"]) if c["@ask"] else "")
+                for ln in wrap(msg, w - 1, 2):
+                    if y >= H - 2: break
+                    scr.addstr(y, 1, ln, pairs["dim"]); y += 1
+            for r in range(top, y): rowmap[r] = i
+            y += 1
+        scr.addstr(H - 1, 0, cut(" 點卡片跳過去", w), pairs["dim"])
+        scr.refresh()
+        try:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR1})  # 等按鍵時才接受叫醒
+            k = scr.getch()
+        except Wake:
+            continue
+        target = None
+        if k == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, b = curses.getmouse()
+                if b & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED) and my in rowmap:
+                    cursor = rowmap[my]; target = cards[cursor]
+            except curses.error:
+                pass
+        elif k in (curses.KEY_UP, ord("k")): cursor = max(cursor - 1, 0)
+        elif k in (curses.KEY_DOWN, ord("j")): cursor = min(cursor + 1, len(cards) - 1)
+        elif k in (10, 13, curses.KEY_ENTER) and cards: target = cards[cursor]
+        if target:
+            t("select-pane", "-t", target["pane_id"])
+            if target["window_zoomed_flag"] == "1": t("resize-pane", "-Z", "-t", target["pane_id"])
+
+
+if __name__ == "__main__":
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(main)

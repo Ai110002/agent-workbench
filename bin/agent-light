@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""終端機分頁燈號 + 可點擊通知（GNOME Terminal）。
+
+燈號：🔴 卡住等你（要允許／要回答）　🟢 做完、還沒回　無燈＝沒事
+兩種燈都要等你「送出下一句」才熄（看過不算處理完）；沒回會在 3／6／10 分鐘再提醒。
+狀態檔：~/.local/state/agent-lights/<screen>.json，一個分頁一個；
+Agent 工作台（ws，tmux -L agents）裡的格子是 tmux-<pane>.json。
+
+  agent-light hook done|wait|clear|clear-wait [--agent X] [--msg 文字]
+      給各 agent 的 hook 呼叫；Claude Code 的 JSON 從 stdin 進來。
+  agent-light daemon     背景服務：補燈號、偵測「看過了」就熄 🟢
+  agent-light jump [id]  跳到指定分頁；不給 id＝跳到下一個亮燈分頁（🔴 優先）
+  agent-light list       列出亮燈分頁
+"""
+import json, os, re, subprocess, sys, time
+from pathlib import Path
+
+STATE = Path.home() / ".local/state/agent-lights"
+LOG = Path.home() / ".local/state/agent-lights.log"
+LIGHT = {"wait": "🔴", "done": "🟢"}
+# 標題開頭要剝掉的符號：我們的燈號、Claude Code 的轉圈與閒置符號
+STRIP_RE = re.compile(r"^(?:[🔴🟢◐◓◑◒✳✻✽✶✢·⠀-⣿]️?\s*)+")
+SPIN_RE = re.compile(r"^[◐◓◑◒✻✽✶✢·⠀-⣿]")
+REMIND = [180, 360, 600]  # 亮燈後幾秒還沒回就再提醒（聲音＋不會自己消失的通知）
+SOUND = {"done": "complete.oga", "wait": "window-attention.oga", "remind": "message-new-instant.oga"}
+TMUX = ["tmux", "-L", "agents"]
+WS_TITLE = "Agent 工作台"
+
+
+def log(*a):
+    try:
+        with LOG.open("a") as f:
+            f.write(time.strftime("%F %T ") + " ".join(map(str, a)) + "\n")
+    except OSError:
+        pass
+
+
+_bus = None
+
+
+def call(path, method, args=None, sig=None):
+    global _bus
+    from gi.repository import Gio, GLib
+    if _bus is None:
+        _bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    iface, meth = method.rsplit(".", 1)
+    try:
+        r = _bus.call_sync("org.gnome.Terminal", path, iface, meth,
+                           GLib.Variant(sig, args) if sig else None, None, Gio.DBusCallFlags.NONE, 5000, None)
+        return r.unpack()
+    except Exception as e:
+        log("dbus", method, e)
+        return None
+
+
+SP = "/org/gnome/Terminal/SearchProvider"
+SP_I = "org.gnome.Shell.SearchProvider2."
+
+
+def titles(ids):
+    """screen id → 目前分頁標題（不存在的分頁不會出現在結果裡）"""
+    if not ids:
+        return {}
+    r = call(SP, SP_I + "GetResultMetas", (list(ids),), "(as)")
+    return {m["id"]: m.get("name", "") for m in (r[0] if r else [])}
+
+
+def live_screens():
+    r = call(SP, SP_I + "GetInitialResultSet", ([""],), "(as)")
+    return set(r[0]) if r else set()
+
+
+def bare(title):
+    return STRIP_RE.sub("", title or "").strip()
+
+
+def set_title(st, text):
+    try:
+        with open(st["pts"], "w") as f:
+            f.write(f"\033]0;{text}\007")
+    except (OSError, KeyError, TypeError):
+        pass
+
+
+def load(sid):
+    try:
+        return json.loads((STATE / f"{sid}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def save(st):
+    STATE.mkdir(parents=True, exist_ok=True)
+    tmp = STATE / f".{st['id']}.tmp"
+    tmp.write_text(json.dumps(st, ensure_ascii=False))
+    tmp.replace(STATE / f"{st['id']}.json")
+
+
+def drop(sid):
+    try:
+        (STATE / f"{sid}.json").unlink()
+    except OSError:
+        pass
+
+
+def all_states():
+    out = []
+    for p in STATE.glob("*.json"):
+        try:
+            out.append(json.loads(p.read_text()))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def find_terminal():
+    """往上找祖先程序：GNOME_TERMINAL_SCREEN 與分頁的 /dev/pts/N"""
+    sid = os.environ.get("GNOME_TERMINAL_SCREEN", "")
+    pts = None
+    pid = os.getpid()
+    for _ in range(30):
+        if pts is None:
+            try:
+                fd0 = os.readlink(f"/proc/{pid}/fd/0")
+                if fd0.startswith("/dev/pts/"):
+                    pts = fd0
+            except OSError:
+                pass
+        if not sid:
+            try:
+                env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+                for e in env:
+                    if e.startswith(b"GNOME_TERMINAL_SCREEN="):
+                        sid = e.split(b"=", 1)[1].decode()
+            except OSError:
+                pass
+        if sid and pts:
+            break
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        if pid <= 1:
+            break
+    if sid and not pts:  # 祖先鏈斷了（呼叫端先結束）
+        pts = pts_of(sid.rsplit("/", 1)[-1].replace("_", "-"))
+    sid = sid.rsplit("/", 1)[-1].replace("_", "-") if sid else ""
+    return sid, pts
+
+
+def pts_of(sid):
+    """掃 /proc：找同一個分頁（GNOME_TERMINAL_SCREEN）裡接著 /dev/pts 的程序"""
+    want = b"GNOME_TERMINAL_SCREEN=/org/gnome/Terminal/screen/" + sid.replace("-", "_").encode()
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            fd0 = os.readlink(d / "fd/0")
+            if fd0.startswith("/dev/pts/") and want in (d / "environ").read_bytes().split(b"\0"):
+                return fd0
+        except OSError:
+            pass
+    return None
+
+
+def screen_by_title(name):
+    """找標題（去掉燈號／轉圈符號後）以 name 開頭的分頁；剛好一個才算"""
+    if not name:
+        return None
+    hits = [sid for sid, t in titles(live_screens()).items() if bare(t).startswith(name)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def codex_thread_name(session_id):
+    name = None
+    try:
+        with (Path.home() / ".codex/session_index.jsonl").open() as f:
+            for line in f:
+                if session_id in line:
+                    name = json.loads(line).get("thread_name") or name
+    except (OSError, ValueError):
+        pass
+    return name
+
+
+# ---------- Agent 工作台（tmux -L agents）----------
+def tmux(*args):
+    try:
+        r = subprocess.run(TMUX + list(args), capture_output=True, text=True, timeout=5)
+        return r.stdout if r.returncode == 0 else None
+    except Exception as e:
+        log("tmux", e)
+        return None
+
+
+def find_tmux_pane():
+    """祖先程序裡有 TMUX_PANE，且屬於 agents 這台 tmux 伺服器 → 回傳 %N"""
+    pid = os.getpid()
+    for _ in range(30):
+        try:
+            env = dict(e.split(b"=", 1) for e in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0") if b"=" in e)
+            if env.get(b"TMUX_PANE"):
+                sock = env.get(b"TMUX", b"").split(b",")[0]
+                return env[b"TMUX_PANE"].decode() if sock.endswith(b"/agents") else None
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+        if pid <= 1:
+            return None
+    return None
+
+
+def tmux_panes():
+    out = tmux("list-panes", "-a", "-F", "#{pane_id}")
+    return set(out.split()) if out is not None else None
+
+
+def tset(pane, key, val=None):
+    if val is None:
+        tmux("set", "-p", "-u", "-t", pane, key)
+    else:  # 值裡的 # 會被 tmux 當格式碼
+        tmux("set", "-p", "-t", pane, key, str(val).replace("#", "＃"))
+
+
+def tget(pane, key):
+    return (tmux("show", "-p", "-q", "-v", "-t", pane, key) or "").strip()
+
+
+def viewing_pane(pane):
+    """這一格是工作台裡被選中的那格，而且工作台視窗正被看著"""
+    if (tmux("display", "-p", "-t", pane, "#{pane_active}#{window_active}#{session_attached}") or "").strip()[:3] != "111":
+        return False
+    v = viewed_title()
+    return v is not None and WS_TITLE in v
+
+
+def jump_tmux(pane):
+    tmux("select-window", "-t", pane)
+    tmux("select-pane", "-Z", "-t", pane)
+    for pid in (tmux("list-clients", "-F", "#{client_pid}") or "").split():
+        try:
+            for e in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+                if e.startswith(b"GNOME_TERMINAL_SCREEN="):
+                    jump(e.split(b"=", 1)[1].decode().rsplit("/", 1)[-1].replace("_", "-"))
+                    return
+        except OSError:
+            pass
+    # 工作台沒開著：開一個新視窗接上去
+    subprocess.Popen(["gnome-terminal", "--maximize", "--", os.path.expanduser("~/.local/bin/ws")],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def is_tmux(sid):
+    return sid.startswith("tmux-")
+
+
+def pane_of(sid):
+    return "%" + sid[5:]
+
+
+def play(kind):
+    subprocess.Popen(["pw-play", f"/usr/share/sounds/freedesktop/stereo/{SOUND[kind]}"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+# ---------- AT-SPI：現在使用者正在看哪個分頁 ----------
+_atspi_app = None
+
+
+def viewed_title():
+    """回傳「終端機視窗有焦點」時被選中分頁的標題；沒在看終端機就回 None"""
+    global _atspi_app
+    try:
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
+        if _atspi_app is None or not _atspi_app.get_name():
+            _atspi_app = None
+            d = Atspi.get_desktop(0)
+            for i in range(d.get_child_count()):
+                a = d.get_child_at_index(i)
+                if a and a.get_name() == "gnome-terminal-server":
+                    _atspi_app = a
+        if _atspi_app is None:
+            return None
+        for i in range(_atspi_app.get_child_count()):
+            frame = _atspi_app.get_child_at_index(i)
+            if not frame or not frame.get_state_set().contains(Atspi.StateType.ACTIVE):
+                continue
+            stack = [frame]
+            while stack:
+                a = stack.pop()
+                if a.get_role() == Atspi.Role.PAGE_TAB:
+                    if a.get_state_set().contains(Atspi.StateType.SELECTED):
+                        return a.get_name()
+                    continue
+                stack.extend(a.get_child_at_index(j) for j in range(a.get_child_count()))
+            # 只有一個分頁時沒有 page tab，視窗標題就是分頁標題
+            return frame.get_name()
+    except Exception as e:  # AT-SPI 斷線就下一輪重抓
+        _atspi_app = None
+        log("atspi", e)
+    return None
+
+
+def is_viewing(sid):
+    if is_tmux(sid):
+        return viewing_pane(pane_of(sid))
+    v = viewed_title()
+    return v is not None and v == titles([sid]).get(sid)
+
+
+# ---------- 動作 ----------
+def jump(sid):
+    if is_tmux(sid):
+        jump_tmux(pane_of(sid))
+    else:
+        call(SP, SP_I + "ActivateResult", (sid, [], 0), "(sasu)")
+
+
+def notify(st, body, urgent=False):
+    icon = LIGHT[st["state"]]
+    head = {"wait": "等你決定", "done": "做完了"}[st["state"]]
+    summary = f"{icon} {st['agent']} {head}：{st['name']}"
+    cmd = ["notify-send", "-a", st["agent"], "-i", "utilities-terminal", *(["-u", "critical"] if urgent else []),
+           "-A", "default=前往", summary, body or "點這裡跳過去"]
+    # 另起一個背景程序等使用者點，點了就跳過去（不用 fork：Gio 已開執行緒）
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_wait", st["id"], st["name"], *cmd],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def wait_click(sid, name, cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=6 * 3600)
+        if r.stdout.strip() in ("default", "go"):
+            jump(sid)
+            log("clicked", sid, name)
+    except Exception as e:
+        log("notify", e)
+
+
+HEADLESS = {"claude": {"-p", "--print"}, "codex": {"exec", "e"}, "grok": {"-p", "--prompt"},
+            "copilot": {"-p", "--prompt"}, "opencode": {"run"}, "gemini": {"-p", "--prompt"}}
+
+
+def headless():
+    """最近的 agent 祖先是 `claude -p`／`codex exec` 這類背景呼叫（程式裡呼叫 AI 產文案等），不是在跟使用者對話"""
+    pid = os.getppid()
+    for _ in range(10):
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        # node／python 包裝的 CLI：argv[0] 是直譯器，真正的指令在 argv[1]
+        for k in range(min(2, len(argv))):
+            name = os.path.basename(argv[k])
+            if name in HEADLESS:
+                return bool(HEADLESS[name] & set(argv[k + 1:]))
+        if pid <= 1:
+            return False
+    return False
+
+
+def detect_agent():
+    """沒指定 --agent 時，從祖先程序猜是哪個 agent（Grok 也會讀 ~/.claude/settings.json 的 hooks）"""
+    pid = os.getppid()
+    for _ in range(6):
+        try:
+            args = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").lower()
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        for key, name in (("grok", "Grok"), ("codex", "Codex"), ("copilot", "Copilot"), ("opencode", "OpenCode"),
+                          ("dsh", "DSH"), ("antigravity", "Antigravity"), ("agy", "Antigravity"), ("claude", "Claude Code")):
+            if key in args:
+                return name
+    return "Claude Code"
+
+
+def hook(event, agent, msg, opt):
+    data = {}
+    if not sys.stdin.isatty():
+        try:
+            import select  # 呼叫端沒關 stdin 也不能卡住
+            raw = sys.stdin.read() if select.select([sys.stdin], [], [], 1.0)[0] else ""
+            data = json.loads(raw) if raw.strip() else {}
+        except Exception:
+            pass
+    if data.get("reason") == "shutdown":  # Grok 關閉時也發 Stop
+        return 0
+    if event in ("done", "wait") and headless():
+        log("skip-headless", event, os.getcwd())
+        return 4
+    pane = pane_of(opt["sid"]) if is_tmux(opt.get("sid", "")) else (None if opt.get("sid") else find_tmux_pane())
+    if pane:
+        return hook_tmux(pane, event, agent, msg, data)
+    if event == "reset":
+        return 0
+    if event in ("clear", "clear-wait"):  # 每次工具呼叫都會跑：沒有亮燈就馬上結束
+        lit = all_states()
+        if not lit or (event == "clear-wait" and not any(x["state"] == "wait" for x in lit)):
+            return 0
+    if not agent:
+        agent = detect_agent()
+    if opt.get("sid"):
+        sid, pts = opt["sid"], opt.get("pts") or pts_of(opt["sid"])
+    else:
+        sid, pts = find_terminal()
+        if agent == "Codex" and data.get("session_id"):
+            # Codex 的 hook 從共用的 app-server 發出，環境變數是第一個開它的分頁；改用對話名稱比對分頁標題
+            hit = screen_by_title(codex_thread_name(data["session_id"]))
+            if hit:
+                sid, pts = hit, pts_of(hit)
+    if not sid:  # 不在 GNOME Terminal 裡：交給呼叫端自己通知
+        return 3
+    st = load(sid)
+    if event in ("clear", "clear-wait"):
+        if st and (event == "clear" or st["state"] == "wait"):
+            if not os.access(STATE, os.W_OK):
+                subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--", os.path.abspath(__file__),
+                                "hook", event, "--sid", sid], stdin=subprocess.DEVNULL, timeout=10)
+                return
+            drop(sid)
+            set_title(st, bare(titles([sid]).get(sid, st.get("name", ""))))
+        return
+    if event == "wait":
+        msg = msg or data.get("message") or ""
+        if data.get("tool_name") == "AskUserQuestion":
+            try:
+                msg = data["tool_input"]["questions"][0]["question"]
+            except (KeyError, IndexError, TypeError):
+                msg = msg or "有問題要問你"
+    else:
+        msg = msg or data.get("last_assistant_message") or data.get("last-assistant-message") or ""
+    msg = " ".join(msg.split())[:160]
+    name = bare(titles([sid]).get(sid, "")) or Path.cwd().name
+    st = {"id": sid, "pts": pts, "state": event, "agent": agent, "name": name, "msg": msg, "ts": time.time()}
+    try:
+        save(st)
+    except OSError:  # 沙盒（例如 DSH workspace-write）擋寫家目錄：請 systemd --user 在沙盒外代跑
+        subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--", os.path.abspath(__file__),
+                        "hook", event, "--agent", agent, "--msg", msg, "--sid", sid, "--pts", pts or ""],
+                       stdin=subprocess.DEVNULL, timeout=10)
+        return
+    set_title(st, f"{LIGHT[event]} {name}")
+    log(event, agent, sid, name)
+    if not is_viewing(sid):  # 正在看著這個分頁就不必跳通知
+        notify(st, msg)
+
+
+def wait_msg(event, msg, data):
+    if event == "wait":
+        msg = msg or data.get("message") or ""
+        if data.get("tool_name") == "AskUserQuestion":
+            try:
+                msg = data["tool_input"]["questions"][0]["question"]
+            except (KeyError, IndexError, TypeError):
+                msg = msg or "有問題要問你"
+    else:
+        msg = msg or data.get("last_assistant_message") or data.get("last-assistant-message") or ""
+    return " ".join(msg.split())[:160]
+
+
+def hook_tmux(pane, event, agent, msg, data):
+    """工作台格子：燈號寫進 tmux 的格子變數（@light @msg @ask @task），邊框與底列直接顯示"""
+    sid = "tmux-" + pane[1:]
+    if not os.access(STATE, os.W_OK):  # 沙盒擋寫家目錄：請 systemd --user 在沙盒外代跑
+        subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--", os.path.abspath(__file__),
+                        "hook", event, "--agent", agent or "", "--msg", wait_msg(event, msg, data) if event in LIGHT else "",
+                        "--sid", sid], stdin=subprocess.DEVNULL, timeout=10)
+        return 0
+    st = load(sid)
+    if event in ("clear", "clear-wait", "reset"):
+        if st and (event != "clear-wait" or st["state"] == "wait"):
+            drop(sid)
+            tset(pane, "@light")
+            tset(pane, "@age")
+        if event == "reset":  # /clear 開新工作：舊名稱、舊問答一起清掉
+            for k in ("@task", "@ask", "@msg"):
+                tset(pane, k)
+        elif event == "clear":
+            p = " ".join((data.get("prompt") or "").split())
+            if p:
+                tset(pane, "@ask", p[:200])
+                if not tget(pane, "@task"):  # 還沒命名：先用第一句話當名稱，F2 可改
+                    tset(pane, "@task", p[:18])
+        return 0
+    if not agent:
+        agent = detect_agent()
+    msg = wait_msg(event, msg, data)
+    name = tget(pane, "@task") or bare(tmux("display", "-p", "-t", pane, "#{pane_title}") or "") or Path.cwd().name
+    st = {"id": sid, "pane": pane, "state": event, "agent": agent, "name": name, "msg": msg, "ts": time.time()}
+    save(st)
+    tset(pane, "@light", event)
+    tset(pane, "@msg", msg)
+    tset(pane, "@age", "剛剛")
+    tmux("refresh-client", "-S")
+    log(event, agent, sid, name)
+    if event == "wait":
+        play("wait")
+    if not viewing_pane(pane):
+        notify(st, msg)
+    return 0
+
+
+def remind(st, now):
+    """亮燈太久沒回：再響一次＋跳一張不會自己消失的通知（正在看那格就只閃不響）"""
+    n = st.get("alerts", 0)
+    if n >= len(REMIND) or now - st["ts"] < REMIND[n]:
+        return
+    st["alerts"] = n + 1
+    save(st)
+    if is_viewing(st["id"]):
+        return
+    mins = int((now - st["ts"]) // 60)
+    play("remind")
+    notify(st, f"已經等你 {mins} 分鐘了｜{st.get('msg', '')}", urgent=True)
+    log("remind", st["id"], st["name"], mins)
+
+
+def daemon():
+    last_age = 0
+    while True:
+        try:
+            states = all_states()
+            now = time.time()
+            tstates = [s for s in states if is_tmux(s["id"])]
+            if tstates:
+                panes = tmux_panes()
+                for st in tstates:
+                    if panes is not None and st["pane"] not in panes:  # 格子關了
+                        drop(st["id"])
+                        continue
+                    remind(st, now)
+                    if now - last_age >= 20:
+                        m = int((now - st["ts"]) // 60)
+                        tset(st["pane"], "@age", f"{m} 分鐘" if m else "剛剛")
+                if now - last_age >= 20:
+                    last_age = now
+            states = [s for s in states if not is_tmux(s["id"])]
+            if states:
+                cur = titles([s["id"] for s in states])
+                alive = live_screens()
+                for st in states:
+                    sid = st["id"]
+                    if alive and sid not in alive:  # 分頁關了
+                        drop(sid)
+                        continue
+                    t = cur.get(sid, "")
+                    remind(st, now)
+                    want = LIGHT[st["state"]]
+                    # 被 agent 自己的標題蓋掉就補回去；正在轉圈（工作中）不搶
+                    if t and not t.startswith(want) and not SPIN_RE.match(t):
+                        name = bare(t) or st["name"]
+                        set_title(st, f"{want} {name}")
+                        if name != st["name"]:
+                            st["name"] = name
+                            save(st)
+        except Exception as e:
+            log("daemon", e)
+        time.sleep(1)
+
+
+def live_states():
+    alive, panes = live_screens(), None
+    out = []
+    for s in all_states():
+        if is_tmux(s["id"]):
+            panes = tmux_panes() if panes is None else panes
+            if panes and s["pane"] in panes:
+                out.append(s)
+        elif s["id"] in alive:
+            out.append(s)
+    return out
+
+
+def next_lit():
+    states = live_states()
+    states.sort(key=lambda s: (s["state"] != "wait", s["ts"]))
+    if not states:
+        return None
+    # 已經停在某個亮燈分頁時，跳到下一個，才能用同一個快捷鍵輪流巡
+    v = viewed_title()
+    cur = titles([s["id"] for s in states if not is_tmux(s["id"])])
+    ids = [s["id"] for s in states]
+    for i, sid in enumerate(ids):
+        here = viewing_pane(pane_of(sid)) if is_tmux(sid) else (v is not None and cur.get(sid) == v)
+        if here:
+            return ids[(i + 1) % len(ids)]
+    return ids[0]
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        print(__doc__)
+        return
+    cmd = a[0]
+    opt = {}
+    rest = []
+    i = 1
+    while i < len(a):
+        if a[i] in ("--agent", "--msg", "--sid", "--pts") and i + 1 < len(a):
+            opt[a[i][2:]] = a[i + 1]
+            i += 2
+        else:
+            rest.append(a[i])
+            i += 1
+    if cmd == "hook":
+        sys.exit(hook(rest[0], opt.get("agent", ""), opt.get("msg", ""), opt) or 0)
+    elif cmd == "_wait":
+        wait_click(a[1], a[2], a[3:])
+    elif cmd == "daemon":
+        daemon()
+    elif cmd == "jump":
+        sid = rest[0] if rest else next_lit()
+        if sid:
+            jump(sid)
+        else:
+            subprocess.run(["notify-send", "-t", "1500", "沒有亮燈的分頁"])
+    elif cmd == "list":
+        cur = titles([s["id"] for s in all_states() if not is_tmux(s["id"])])
+        for s in sorted(all_states(), key=lambda s: s["ts"]):
+            where = f"工作台 {s['name']}" if is_tmux(s["id"]) else cur.get(s["id"], "(分頁已關)")
+            print(LIGHT[s["state"]], s["agent"], "|", where, "|", time.strftime("%H:%M", time.localtime(s["ts"])), "|", s["msg"][:60])
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

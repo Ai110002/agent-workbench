@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Agent 工作台：一個視窗塞多個工作（tmux -L agents），每格有名稱、燈號、最後問答。
+#   ws                 打開／接回工作台（不在終端機裡就開一個最大化的 GNOME Terminal）
+#   ws new [名稱]       新增一格（格狀模式自動重排；單格模式直接切過去）
+#   ws name <名稱>      幫目前這格取名（agent 也可以自己呼叫）
+#   ws grid            重新排成等大格子（依螢幕比例，空位補「空格」）
+#   ws side [on|off]   開關右邊的側邊欄（F7）：每個工作的燈號、資料夾、git 分支、網路埠、最後一句
+#   ws restore         終端機被關掉後，把上次開著的對話全部接回來（側邊欄每 5 秒記一次）
+#   ws mode [grid|single]  切換 格狀（全部一起看）／單格（一次一個塞滿）
+#   ws pick            總覽＋選一個跳過去（F3）
+#   ws ls              列出所有工作
+# 快捷鍵：F2 命名 F3 總覽 F4 切模式 F5 新增 F6 下一個亮燈 F8 關閉 Alt+數字 直接跳
+set -u
+CONF="$HOME/.config/agent-ws/tmux.conf"
+T=(tmux -L agents -f "$CONF")
+S=work
+FMT=$'#{pane_id}\t#{@slot}\t#{@light}\t#{@task}\t#{@age}\t#{@ask}\t#{@msg}\t#{pane_title}'
+
+ensure() {
+  "${T[@]}" has-session -t "$S" 2>/dev/null && return
+  "${T[@]}" new-session -d -s "$S" -c "$HOME" -x 240 -y 60
+  # 開工作台的那個環境如果是某個 agent，別讓格子繼承它的身分
+  for v in $("${T[@]}" show-environment -g | grep -oE '^(CLAUDE[A-Z_]*|AI_AGENT)='); do "${T[@]}" set-environment -g -u "${v%=}"; done
+  [ "$("${T[@]}" show -gqv @sidebar)" = off ] || side_on
+}
+side_id() { "${T[@]}" list-panes -t "$S" -F '#{pane_id} #{@role}' | awk '$2=="sidebar"{print $1; exit}'; }
+side_on() {
+  [ -n "$(side_id)" ] && return
+  first=$("${T[@]}" list-panes -t "$S" -F '#{pane_id}' | head -1)
+  p=$("${T[@]}" split-window -d -h -t "$first" -P -F '#{pane_id}' "trap \"\" INT TSTP USR1; while :; do $HOME/.local/bin/ws-sidebar 2>>$HOME/.local/state/agent-ws-sidebar.log || echo \"\$(date '+%F %T') 側邊欄結束 rc=\$?\" >>$HOME/.local/state/agent-ws-sidebar.log; sleep 1; done")
+  "${T[@]}" set -p -t "$p" @role sidebar
+  "$HOME/.local/bin/ws-grid"
+}
+
+case "${1:-}" in
+  "")
+    ensure
+    if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
+      exec "${T[@]}" attach -t "$S"
+    elif [ -n "${TMUX:-}" ]; then
+      echo "已經在 tmux 裡了"
+    else
+      exec gnome-terminal --maximize -- "$0"
+    fi ;;
+  new)
+    ensure
+    # 有「空格」就直接用它，不用切新的，排版不會動
+    p=$("${T[@]}" list-panes -t "$S" -F '#{pane_id}	#{@task}	#{pane_current_command}' | awk -F'\t' '$2=="空格" && $3 ~ /^(bash|zsh|sh)$/ {print $1; exit}')
+    if [ -z "$p" ]; then
+      n=$("${T[@]}" display -p -t "$S" '#{window_panes}')
+      max=$("${T[@]}" show -gqv @max_panes); max=${max:-8}
+      if [ "$n" -ge "$max" ]; then
+        "${T[@]}" display -d 3000 "已經 $n 格（上限 $max）。先 F8 關掉做完的，或 tmux -L agents set -g @max_panes N 改上限"
+        exit 1
+      fi
+      p=$("${T[@]}" split-window -t "$S" -c "$HOME" -P -F '#{pane_id}')
+      $HOME/.local/bin/ws-grid
+    fi
+    "${T[@]}" set -p -t "$p" @task "${2:-}"; [ -z "${2:-}" ] && "${T[@]}" set -p -t "$p" -u @task
+    "${T[@]}" select-pane -t "$p"
+    [ "$("${T[@]}" display -p -t "$S" '#{window_zoomed_flag}')" = 1 ] && "${T[@]}" select-pane -Z -t "$p"
+    true ;;
+  grid) exec "$HOME/.local/bin/ws-grid" ;;
+  go)  # Alt+數字：跳到第 N 個工作
+    p=$("${T[@]}" list-panes -t "$S" -F '#{pane_id} #{@slot}' | awk -v n="${2:-1}" '$2==n{print $1; exit}')
+    [ -n "$p" ] && "${T[@]}" select-pane -t "$p" ;;
+  side)
+    ensure; id=$(side_id)
+    case "${2:-toggle}" in
+      on) "${T[@]}" set -g @sidebar on; side_on ;;
+      off) "${T[@]}" set -g @sidebar off; [ -n "$id" ] && "${T[@]}" kill-pane -t "$id" ;;
+      *) if [ -n "$id" ]; then "${T[@]}" set -g @sidebar off; "${T[@]}" kill-pane -t "$id"; else "${T[@]}" set -g @sidebar on; side_on; fi ;;
+    esac; true ;;
+  restore)
+    f="$HOME/.config/agent-ws/last.json"; [ -f "$f" ] || { echo "沒有存檔：$f"; exit 1; }
+    ensure
+    python3 - "$f" <<'PY' | while IFS=$'\t' read -r task cfg sid cwd; do
+import json, sys
+d = json.load(open(sys.argv[1]))
+print("上次存檔：", d["saved_at"], file=sys.stderr)
+for p in d["panes"]:
+    if p["agent"] == "claude" and p["session"]:
+        print("\t".join([p["task"] or "", p["config"], p["session"], p["cwd"]]))
+PY
+      # 已經開著同一個對話就跳過
+      if pgrep -f -- "--resume $sid" >/dev/null; then echo "已開著：$task"; continue; fi
+      "$0" new "$task" >/dev/null
+      p=$("${T[@]}" display -p -t "$S" '#{pane_id}')
+      env=""; [ "$cfg" != "$HOME/.claude" ] && env="CLAUDE_CONFIG_DIR=$cfg "
+      "${T[@]}" send-keys -t "$p" "cd $(printf %q "$cwd") && ${env}claude --dangerously-skip-permissions --resume $sid" Enter
+      echo "接回：$task"
+    done ;;
+  clear)  # F8：這格變回空格（不刪格子，排版不跳）
+    p=${2:-$TMUX_PANE}
+    "${T[@]}" respawn-pane -k -t "$p" -c "$HOME"
+    for o in @light @msg @ask @age; do "${T[@]}" set -p -t "$p" -u $o; done
+    "${T[@]}" set -p -t "$p" @task "空格" ;;
+  name)
+    shift; [ -n "${TMUX_PANE:-}" ] || { echo "要在工作台的格子裡用"; exit 1; }
+    "${T[@]}" set -p -t "$TMUX_PANE" @task "${*//#/＃}" ;;
+  mode)
+    z=$("${T[@]}" display -p -t "$S" '#{window_zoomed_flag}')
+    case "${2:-toggle}" in
+      grid) [ "$z" = 1 ] && "${T[@]}" resize-pane -Z -t "$S"; $HOME/.local/bin/ws-grid ;;
+      single) [ "$z" = 0 ] && "${T[@]}" resize-pane -Z -t "$S" ;;
+      *) "${T[@]}" resize-pane -Z -t "$S"; [ "$z" = 1 ] && $HOME/.local/bin/ws-grid ;;
+    esac; true ;;
+  ls)
+    "${T[@]}" list-panes -s -t "$S" -F "$FMT" | awk -F'\t' -v s="$(side_id)" '$1!=s' | awk -F'\t' '{l=$3=="wait"?"🔴":$3=="done"?"🟢":"  "; printf "%s %s %-20s %s\n", l, $2, ($4==""?"(未命名)":$4), ($7!=""?$7:$6)}' ;;
+  pick)
+    list=$("${T[@]}" list-panes -s -t "$S" -F "$FMT" | awk -F'\t' -v s="$(side_id)" '$1!=s' | awk -F'\t' '
+      { o=$3=="wait"?0:$3=="done"?1:2; l=$3=="wait"?"🔴 等你":$3=="done"?"🟢 做完":"   進行"; if($5!="" && o<2) l=l " " $5
+        name=($4==""?"(未命名)":$4); last=($7!=""?"它說：" $7:($6!=""?"你問：" $6:$8))
+        printf "%d\t%s\t%s  %s  %-22s  %s\n", o, $1, l, $2, name, substr(last,1,90) }' | sort -s -k1,1n | cut -f2-)
+    [ -z "$list" ] && exit 0
+    sel=$(printf '%s\n' "$list" | fzf --ansi --delimiter=$'\t' --with-nth=2 --reverse --no-sort \
+          --header="↑↓ 選、Enter 跳過去、Esc 取消　（右邊是那格最後的畫面）" \
+          --preview="tmux -L agents capture-pane -p -e -t {1} | grep -v '^\s*$' | tail -n 60" \
+          --preview-window=right,55%,wrap) || exit 0
+    "${T[@]}" select-pane -Z -t "${sel%%$'\t'*}" ;;
+  *) sed -n '2,10p' "$0" ;;
+esac

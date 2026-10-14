@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Agent 工作台
+Comment=Claude Code／Codex／Grok 多格工作台
+Exec=sh -c 'gnome-terminal --maximize -- "$HOME/.local/bin/ws"'
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;

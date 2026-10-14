@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "Stop": [{"hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-done-notify auto"}]}],
+    "Notification": [{"matcher": "permission_prompt|elicitation_dialog", "hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-light hook wait"}]}],
+    "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-light hook wait"}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "s=\"$(basename \"$GNOME_TERMINAL_SCREEN\" | tr _ -)\"; case \"$TMUX\" in */agents,*) s=\"tmux-${TMUX_PANE#%}\";; esac; [ -e \"$HOME/.local/state/agent-lights/$s.json\" ] && $HOME/.local/bin/agent-light hook clear-wait; true"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-light hook clear"}]}],
+    "SessionStart": [{"matcher": "clear", "hooks": [{"type": "command", "command": "$HOME/.local/bin/agent-light hook reset"}]}]
+  }
+}

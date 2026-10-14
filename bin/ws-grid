@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""把工作台排成等大的格子（依螢幕比例選欄列），不足的位置補「空格」。ws grid 呼叫這支。"""
+import subprocess, os
+T = ["tmux", "-L", "agents"]
+S = "work"
+def t(*a): return subprocess.run(T + list(a), capture_output=True, text=True).stdout.strip()
+W, H = map(int, t("display", "-p", "-t", S, "#{window_width} #{window_height}").split())
+def listing():
+    rows = [l.split("\t") for l in t("list-panes", "-t", S, "-F", "#{pane_id}\t#{@role}").splitlines()]
+    side = next((r[0] for r in rows if r[1:] == ["sidebar"]), None)
+    return [r[0] for r in rows if r[0] != side], side
+panes, side = listing()
+SW = int(t("show", "-gqv", "@sidebar_width") or 20) if side else 0
+GW = W - SW - 1 if side else W  # 格子區的寬度（側邊欄在最左邊）
+X0 = SW + 1 if side else 0
+n = len(panes)
+if n == 0: raise SystemExit
+# 字格的像素比例（寬:高 ≈ 1:3），用來推算每格實際長寬比，挑最接近螢幕比例、空位最少的排法
+cell_ratio = float(t("show", "-gqv", "@cell_ratio") or 0.33)
+scr = 16 / 9
+import math
+best = None
+for cols in range(1, n + 1):
+    rows = -(-n // cols)
+    holes = cols * rows - n
+    if holes >= cols: continue
+    cw, ch = GW / cols, H / rows
+    aspect = cw * cell_ratio / ch
+    # 太矮（<14 行）或太窄（<40 字）的格子字會擠，重罰；空位輕罰
+    score = abs(math.log(aspect / scr)) + 0.15 * holes + (5 if ch < 14 else 0) + (5 if cw < 40 else 0)
+    if best is None or score < best[0]: best = (score, cols, rows)
+_, cols, rows = best
+for _ in range(cols * rows - n):  # 補空格
+    p = t("split-window", "-d", "-t", panes[0], "-c", os.path.expanduser("~"), "-P", "-F", "#{pane_id}")
+    t("set", "-p", "-t", p, "@task", "空格")
+    t("select-layout", "-t", S, "tiled")
+panes, side = listing()
+panes = [p.lstrip("%") for p in panes]
+def split(total, k):
+    a = [(total - (k - 1)) // k] * k
+    for i in range(total - (k - 1) - sum(a)): a[i] += 1
+    return a
+hs, ws = split(H, rows), split(GW, cols)
+y, rs = 0, []
+for r, h in enumerate(hs):
+    x, cells = X0, []
+    for c, w in enumerate(ws):
+        cells.append(f"{w}x{h},{x},{y},{panes[r * cols + c]}"); x += w + 1
+    rs.append(f"{GW}x{h},{X0},{y}{{" + ",".join(cells) + "}" if cols > 1 else cells[0])
+    y += h + 1
+if rows > 1: grid = [f"{GW}x{H},{X0},0[" + ",".join(rs) + "]"]
+if rows == 1:
+    xs = [X0]
+    for w in ws[:-1]: xs.append(xs[-1] + w + 1)
+    grid = [f"{w}x{H},{x},0,{pid}" for w, x, pid in zip(ws, xs, panes)]
+if side:
+    body = f"{W}x{H},0,0{{" + ",".join([f"{SW}x{H},0,0,{side.lstrip('%')}"] + grid) + "}"
+elif len(grid) == 1 and rows > 1:
+    body = grid[0].replace(f"{GW}x{H},0,0[", f"{W}x{H},0,0[", 1)
+elif len(grid) == 1:
+    body = grid[0]
+else:
+    body = f"{W}x{H},0,0{{" + ",".join(grid) + "}"
+ck = 0
+for ch in body: ck = ((ck >> 1) | ((ck & 1) << 15)); ck = (ck + ord(ch)) & 0xffff
+t("select-layout", "-t", S, f"{ck:04x},{body}")
+# tmux 套排版時不看字串裡的格子編號，照目前順序填格，所以排好後再把格子換到該在的位置（側邊欄最前）
+want = ([side] if side else []) + ["%" + p for p in panes]
+for i, w in enumerate(want):
+    cur = t("list-panes", "-t", S, "-F", "#{pane_id}").split()
+    if cur[i] != w:
+        t("swap-pane", "-d", "-s", w, "-t", cur[i])
+# 側邊欄在最左邊會佔掉第 1 號，另外給每格一個「工作編號」@slot（1、2、3…），畫面和 Alt+數字都用它
+for k, pid in enumerate(t("list-panes", "-t", S, "-F", "#{pane_id}").split()):
+    if pid == side: t("set", "-p", "-t", pid, "-u", "@slot")
+    else: t("set", "-p", "-t", pid, "@slot", str(k + (0 if side else 1)))

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# 工作台的 Ctrl+C／Ctrl+V：
+#   ws-clip copy          從 stdin 收文字放進系統剪貼簿（tmux 反白後呼叫）
+#   ws-clip paste <pane>  剪貼簿是圖片 → 照舊送 Ctrl+V 給格子（Claude 貼圖）；是文字 → 直接貼進去
+export DISPLAY=${DISPLAY:-:0}
+T=(tmux -L agents)
+case "$1" in
+  copy) xclip -selection clipboard -i >/dev/null 2>&1 ;;
+  paste)
+    types=$(timeout 2 xclip -selection clipboard -o -t TARGETS 2>/dev/null)
+    if grep -q '^image/' <<<"$types" || [ -z "$types" ]; then
+      "${T[@]}" send-keys -t "$2" C-v
+    else
+      timeout 2 xclip -selection clipboard -o 2>/dev/null | "${T[@]}" load-buffer -b wsclip - && \
+        "${T[@]}" paste-buffer -p -d -b wsclip -t "$2"
+    fi ;;
+esac

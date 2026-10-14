@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# 用法：agent-done-notify <agent名稱> [codex 傳來的 JSON]
+# Claude Code / Grok 的 Stop hook 從 stdin 給 JSON；Codex notify 用最後一個參數給 JSON。
+agent="${1:-auto}"
+if [ "$agent" = auto ]; then
+  p="$(ps -o args= -p $PPID 2>/dev/null; ps -o args= -p $(ps -o ppid= -p $PPID) 2>/dev/null)"
+  case "$p" in *grok*) agent=Grok;; *agy*|*antigravity*) agent=Antigravity;; *codex*) agent=Codex;; *dsh*) agent=DSH;; *) agent="Claude Code";; esac
+fi
+json="${2:-}"
+[ -z "$json" ] && [ ! -t 0 ] && json="$(timeout 1 cat 2>/dev/null)"
+dir="$(basename "$PWD")"
+# Grok 每輪結束(end_turn)與程式關閉(shutdown)各發一次 Stop；關閉那次不通知，避免一次任務跳兩次
+case "$json" in *'"reason":"shutdown"'*) exit 0;; esac
+msg=""
+if [ -n "$json" ] && command -v jq >/dev/null; then
+  msg="$(printf '%s' "$json" | jq -r '."last-assistant-message" // .last_assistant_message // empty' 2>/dev/null | head -c 160)"
+fi
+printf "%s\t%s\t%s\t%s\t%s\n" "$(date -Is)" "$agent" "$dir" "$(printf %s "$json" | head -c 400 | tr "\n" " ")" "$(ps -o args= -p $PPID 2>/dev/null | head -c 90)" >> "$HOME/.local/state/agent-done-notify.log" 2>/dev/null
+# 燈號＋可點擊通知（點了跳到該分頁）交給 agent-light
+#   rc=4：背景呼叫（claude -p、codex exec…），不是在跟人對話 → 不通知也不出聲
+#   rc=3：不在 GNOME Terminal 分頁裡 → 退回一般通知
+printf '%s' "$json" | "$HOME/.local/bin/agent-light" hook done --agent "$agent" --msg "$msg" >/dev/null 2>&1
+rc=$?
+[ "$rc" = 4 ] && exit 0
+[ "$rc" != 0 ] && notify-send -a "$agent" -i dialog-information "✅ $agent 做完了（$dir）" "${msg:-等你回來看結果}" >/dev/null 2>&1 </dev/null
+pw-play /usr/share/sounds/freedesktop/stereo/complete.oga >/dev/null 2>&1 </dev/null &
+exit 0

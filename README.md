@@ -21,7 +21,7 @@
 - **左側欄**：每個工作一張卡片，有燈號、名稱、agent 和帳號、實際資料夾、git 分支、網路埠、最後一句話；點卡片就跳過去
 - **燈號**：🔴＝在等你允許或回答，🟢＝做完還沒回；格子外框也會跟著變色。要等你送出下一句才會熄（看過不等於處理完），沒回會在 3／6／10 分鐘再提醒
 - **接回對話**：側邊欄每 5 秒記一次每格開著哪個對話。終端機被整個關掉後，打 `ws restore` 就全部接回
-- **Ctrl+C／Ctrl+V 不用加 Shift**：滾輪可以往上捲（不顯示行數時間，名牌出現「⤓ 跳到最底下」可點，捲回底部自動離開）；拖曳反白放開就複製，之後 5 秒內按 Ctrl+C 只提示已複製、不會中斷 agent；其他時候 Ctrl+C 照舊是中斷；Ctrl+V 遇到文字直接貼上，遇到圖片照舊交給 Claude 貼圖
+- **Ctrl+C／Ctrl+V 不用加 Shift**：滾輪可以往上捲（不顯示行數時間，名牌出現 Claude 原本的「Jump to bottom (ctrl+End) ↓」，點它或按 Ctrl+End 回到底部，捲回底部自動離開）；拖曳反白放開就複製，之後 5 秒內按 Ctrl+C 只提示已複製、不會中斷 agent；其他時候 Ctrl+C 照舊是中斷；Ctrl+V 遇到文字直接貼上，遇到圖片照舊交給 Claude 貼圖
 - **防誤觸**：工作台裡停用 Ctrl+Z（會把 agent 整個暫停）；側邊欄不會被 Ctrl+C 弄掉，當掉會自己重開
 
 ## 安裝
@@ -36,7 +36,7 @@ cd agent-workbench
 
 燈號要接上 Claude Code：把 `hooks/claude-settings-hooks.json` 裡的 `hooks` 合併進 `~/.claude/settings.json`。
 
-工作台裡的 Claude 一律用一般介面（`shim/claude` 自動加 `--settings '{"tui":"default"}'`，一般終端機分頁不受影響）：往上捲時輸入框和狀態列會一起被捲下去，四格並排時才有空間看內容；點名牌上的「⤓ 跳到最底下」或捲回底部就回來。有自訂狀態列的話，可以在 `statusLine` 加 `"refreshInterval": 30`，閒置的格子也會定時更新。
+工作台裡的 Claude 一律用一般介面（`shim/claude` 自動加 `--settings '{"tui":"default"}'`，一般終端機分頁不受影響）：往上捲時輸入框和狀態列會一起被捲下去，四格並排時才有空間看內容；點名牌上的「Jump to bottom (ctrl+End) ↓」或捲回底部就回來。有自訂狀態列的話，可以在 `statusLine` 加 `"refreshInterval": 30`，閒置的格子也會定時更新。
 
 ## 使用
 
